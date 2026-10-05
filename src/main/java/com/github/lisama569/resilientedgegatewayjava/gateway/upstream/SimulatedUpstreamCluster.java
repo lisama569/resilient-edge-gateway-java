@@ -28,7 +28,7 @@ public class SimulatedUpstreamCluster implements UpstreamInvoker {
 
     private static final Logger log = LoggerFactory.getLogger(SimulatedUpstreamCluster.class);
 
-    public enum Mode { OK, FAIL, TIMEOUT, FAIL_FIRST_N }
+    public enum Mode { OK, FAIL, TIMEOUT, FAIL_FIRST_N, SLOW_OK }
 
     public static final class Behavior {
         final Mode mode;
@@ -52,6 +52,11 @@ public class SimulatedUpstreamCluster implements UpstreamInvoker {
         /** 睡眠 delayMs，由网关侧按节点 timeout 判定为超时。 */
         public static Behavior timeout(int delayMs) {
             return new Behavior(Mode.TIMEOUT, 0, delayMs);
+        }
+
+        /** 延迟 delayMs 后正常返回成功，用于模拟"慢但健康"的节点。 */
+        public static Behavior slowOk(int delayMs) {
+            return new Behavior(Mode.SLOW_OK, 0, delayMs);
         }
 
         /** 前 n 次调用失败，之后恢复成功，用于模拟短暂故障后自愈。 */
@@ -135,6 +140,17 @@ public class SimulatedUpstreamCluster implements UpstreamInvoker {
             // 睡眠结束也不返回成功：网关侧通常已先超时；若超时设置更宽则记为上游错误
             throw new GatewayException(FailureReason.UPSTREAM_TIMEOUT,
                     "node " + node.getId() + " simulated timeout after " + b.delayMs + "ms");
+        }
+
+        if (b.mode == Mode.SLOW_OK && b.delayMs > 0) {
+            try {
+                Thread.sleep(b.delayMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new GatewayException(FailureReason.UPSTREAM_TIMEOUT,
+                        "node " + node.getId() + " interrupted while sleeping");
+            }
+            // 睡眠结束后走正常成功路径
         }
 
         if (shouldFail) {

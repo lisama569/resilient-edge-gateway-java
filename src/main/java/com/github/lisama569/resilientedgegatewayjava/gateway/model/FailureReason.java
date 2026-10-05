@@ -18,5 +18,7 @@ public enum FailureReason {
     /** 上游返回错误（HTTP 5xx 等） */
     UPSTREAM_ERROR,
     /** 重试后所有节点仍然失败 */
-    ALL_ATTEMPTS_FAILED
+    ALL_ATTEMPTS_FAILED,
+    /** 调用方给定的端到端时间预算耗尽（含预算提前掐断单次尝试），不计节点失败 */
+    BUDGET_EXHAUSTED
 }

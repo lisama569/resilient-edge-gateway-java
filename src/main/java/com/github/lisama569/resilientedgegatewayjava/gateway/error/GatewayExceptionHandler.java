@@ -27,6 +27,7 @@ public class GatewayExceptionHandler {
                     HttpStatus.SERVICE_UNAVAILABLE;
             case UPSTREAM_TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;
             case UPSTREAM_ERROR -> HttpStatus.BAD_GATEWAY;
+            case BUDGET_EXHAUSTED -> HttpStatus.REQUEST_TIMEOUT;
         };
         log.warn("[gateway] 返回失败 status={} reason={} message={}",
                 status.value(), e.getReason(), e.getMessage());

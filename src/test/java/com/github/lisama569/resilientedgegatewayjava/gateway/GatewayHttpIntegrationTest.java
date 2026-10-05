@@ -113,6 +113,44 @@ class GatewayHttpIntegrationTest {
     }
 
     @Test
+    void budgetExhaustedReturns408WithDistinctReason() throws Exception {
+        // 节点超时 200ms，上游 400ms 才返回；调用方只给 100ms 预算 -> 预算先掐断
+        // 两个节点都设慢，避免无会话加权随机落到健康节点导致结果不确定
+        cluster.setBehavior("node-a",
+                com.github.lisama569.resilientedgegatewayjava.gateway.upstream.SimulatedUpstreamCluster.Behavior.timeout(400));
+        cluster.setBehavior("node-b",
+                com.github.lisama569.resilientedgegatewayjava.gateway.upstream.SimulatedUpstreamCluster.Behavior.timeout(400));
+        MvcResult result = mvc.perform(get("/proxy/slow")
+                        .header("X-Request-Id", "http-budget-1")
+                        .header("X-Budget-Ms", "100"))
+                .andExpect(status().isRequestTimeout())
+                .andExpect(jsonPath("$.reason").value("BUDGET_EXHAUSTED"))
+                .andReturn();
+        System.out.println("预算耗尽 -> 408: " + result.getResponse().getContentAsString());
+
+        // 预算掐断不算节点失败：两个节点的健康状态都必须保持 HEALTHY
+        var health = context.getBean(
+                com.github.lisama569.resilientedgegatewayjava.gateway.health.HealthTracker.class);
+        for (String id : new String[]{"node-a", "node-b"}) {
+            org.junit.jupiter.api.Assertions.assertEquals(
+                    com.github.lisama569.resilientedgegatewayjava.gateway.health.HealthTracker.State.HEALTHY,
+                    health.stateOf(id), "预算掐断不得计入节点失败: " + id);
+        }
+
+        // 不带预算的同样请求：行为不变，按节点超时判定为 504 UPSTREAM_TIMEOUT
+        context.getBean(com.github.lisama569.resilientedgegatewayjava.gateway.config.GatewayProperties.class)
+                .setFailureThreshold(100);
+        cluster.setBehavior("node-b",
+                com.github.lisama569.resilientedgegatewayjava.gateway.upstream.SimulatedUpstreamCluster.Behavior.timeout(400));
+        MvcResult noBudget = mvc.perform(get("/proxy/slow")
+                        .header("X-Request-Id", "http-budget-2"))
+                .andExpect(status().isGatewayTimeout())
+                .andExpect(jsonPath("$.reason").value("UPSTREAM_TIMEOUT"))
+                .andReturn();
+        System.out.println("不带预算 -> 仍为 504: " + noBudget.getResponse().getContentAsString());
+    }
+
+    @Test
     void nonIdempotentFailureReturns502AndExecutesOnce() throws Exception {
         cluster.setBehavior("node-a",
                 com.github.lisama569.resilientedgegatewayjava.gateway.upstream.SimulatedUpstreamCluster.Behavior.fail());

@@ -30,10 +30,11 @@ public class GatewayController {
             @RequestHeader(value = "X-Caller", required = false) String caller,
             @RequestHeader(value = "X-Session-Id", required = false) String sessionId,
             @RequestHeader(value = "X-Request-Id", required = false) String requestId,
+            @RequestHeader(value = "X-Budget-Ms", required = false) Long budgetMs,
             jakarta.servlet.http.HttpServletRequest httpRequest) {
         String path = httpRequest.getRequestURI();
         ProxyRequest request = new ProxyRequest(caller, requestId, sessionId,
-                httpRequest.getMethod(), path);
+                httpRequest.getMethod(), path, budgetMs);
         return gatewayService.proxy(request);
     }
 }

@@ -36,8 +36,17 @@ public final class ProxyResponse {
         return attempts;
     }
 
-    /** 单次上游尝试的记录：命中节点、结果与判定依据。 */
-    public record Attempt(String nodeId, String outcome, String reason, long elapsedMs) {
+    /**
+     * 单次上游尝试的记录：命中节点、结果与判定依据。
+     * {@code budgetRemainingMs} 为该次尝试开始时请求剩余的端到端预算，
+     * 请求未设预算时为 null。
+     */
+    public record Attempt(String nodeId, String outcome, String reason, long elapsedMs,
+                          Long budgetRemainingMs) {
+        public Attempt(String nodeId, String outcome, String reason, long elapsedMs) {
+            this(nodeId, outcome, reason, elapsedMs, null);
+        }
+
         public boolean isSuccess() {
             return "SUCCESS".equals(outcome);
         }

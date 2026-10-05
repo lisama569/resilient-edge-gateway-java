@@ -6,6 +6,7 @@ import com.github.lisama569.resilientedgegatewayjava.gateway.model.FailureReason
 import com.github.lisama569.resilientedgegatewayjava.gateway.model.ProxyRequest;
 import com.github.lisama569.resilientedgegatewayjava.gateway.model.ProxyResponse;
 import com.github.lisama569.resilientedgegatewayjava.gateway.model.RouteDecision;
+import com.github.lisama569.resilientedgegatewayjava.gateway.model.TimeBudget;
 import com.github.lisama569.resilientedgegatewayjava.gateway.model.UpstreamNode;
 import com.github.lisama569.resilientedgegatewayjava.gateway.ratelimit.RateLimiter;
 import com.github.lisama569.resilientedgegatewayjava.gateway.route.LoadBalancer;
@@ -56,7 +57,11 @@ public class GatewayService {
     }
 
     public ProxyResponse proxy(ProxyRequest request) {
-        log.info("[gateway] 收到请求 {}", request);
+        // 端到端时间预算：从收到请求这一刻开始计时，后续重试/转移都从这同一个预算里扣。
+        // 预算对象是请求级局部变量，并发请求之间没有任何共享状态。
+        TimeBudget budget = TimeBudget.of(request.getBudgetMs());
+        log.info("[gateway] 收到请求 {} 预算={}", request,
+                budget.hasBudget() ? budget.remainingMs() + "ms" : "无");
 
         // 1) 调用方维度限流（独立配额，与上游维度互不影响）
         if (!rateLimiter.tryAcquire(RateLimiter.DIM_CALLER, request.getCaller())) {
@@ -74,6 +79,16 @@ public class GatewayService {
         List<ProxyResponse.Attempt> attempts = new ArrayList<>();
 
         for (int i = 1; i <= maxAttempts; i++) {
+            // 剩余预算已经不够再发起一次尝试：立即停止，不硬撑到节点超时之后才回结果
+            if (budget.isExhausted()) {
+                log.warn("[gateway] 请求 {} 预算耗尽（已耗时 {}ms），停止继续尝试，已尝试 {} 次",
+                        request.getRequestId(), budget.elapsedMs(), attempts.size());
+                throw new GatewayException(FailureReason.BUDGET_EXHAUSTED,
+                        "budget exhausted after " + budget.elapsedMs() + "ms, "
+                                + attempts.size() + " attempt(s) made for request " + request);
+            }
+            Long remainingAtStart = budget.hasBudget() ? budget.remainingMs() : null;
+
             RouteDecision decision = loadBalancer.select(
                     request, i == 1 ? null : tried);
             if (decision == null) {
@@ -99,7 +114,8 @@ public class GatewayService {
             // 2) 上游节点维度限流（只影响该节点，不影响其他节点配额）
             if (!rateLimiter.tryAcquire(RateLimiter.DIM_UPSTREAM, node.getId())) {
                 attempts.add(new ProxyResponse.Attempt(node.getId(),
-                        "REJECTED", "RATE_LIMITED_UPSTREAM@" + decision.reason(), 0));
+                        "REJECTED", "RATE_LIMITED_UPSTREAM@" + decision.reason(), 0,
+                        remainingAtStart));
                 // 节点维度限流不算节点故障，不熔断；幂等请求可转移到其他节点
                 tried.add(node);
                 log.warn("[gateway] 节点 {} 上游维度限流，{} 请求 {}",
@@ -113,33 +129,52 @@ public class GatewayService {
                 continue;
             }
 
-            // 3) 带超时调用上游
+            // 3) 带超时调用上游：实际等待上限 = min(节点自身超时, 当前剩余预算)
+            long attemptTimeoutMs = budget.attemptTimeoutMs(node.getTimeoutMs());
+            boolean budgetTighter = attemptTimeoutMs < node.getTimeoutMs();
+            if (budgetTighter) {
+                log.info("[gateway] 请求 {} 剩余预算 {}ms 小于节点 {} 超时 {}ms，本次尝试按预算掐表",
+                        request.getRequestId(), remainingAtStart, node.getId(), node.getTimeoutMs());
+            }
             long start = System.currentTimeMillis();
             try {
-                ProxyResponse resp = invokeWithTimeout(node, request);
+                ProxyResponse resp = invokeWithTimeout(node, request, attemptTimeoutMs, budgetTighter);
                 healthTracker.recordSuccess(node);
                 long elapsed = System.currentTimeMillis() - start;
                 attempts.add(new ProxyResponse.Attempt(node.getId(),
-                        "SUCCESS", decision.reason(), elapsed));
-                log.info("[gateway] 请求 {} 最终命中节点 {} 成功（第 {} 次尝试，依据={}）",
-                        request.getRequestId(), node.getId(), i, decision.reason());
+                        "SUCCESS", decision.reason(), elapsed, remainingAtStart));
+                log.info("[gateway] 请求 {} 最终命中节点 {} 成功（第 {} 次尝试，依据={}，剩余预算={}）",
+                        request.getRequestId(), node.getId(), i, decision.reason(),
+                        budget.hasBudget() ? budget.remainingMs() + "ms" : "无");
                 return new ProxyResponse(resp.getStatus(), resp.getBody(),
                         node.getId(), attempts);
             } catch (GatewayException e) {
                 long elapsed = System.currentTimeMillis() - start;
+                if (e.getReason() == FailureReason.BUDGET_EXHAUSTED) {
+                    // 是调用方预算把这次尝试提前掐断的：不算节点失败，
+                    // 不累计连续失败、不影响熔断统计，且预算已尽，直接结束
+                    attempts.add(new ProxyResponse.Attempt(node.getId(),
+                            "ABORTED", "BUDGET_EXHAUSTED@" + decision.reason(),
+                            elapsed, remainingAtStart));
+                    log.warn("[gateway] 请求 {} 在节点 {} 的尝试被预算掐断（等了 {}ms，节点超时 {}ms），"
+                                    + "不计节点失败，停止重试",
+                            request.getRequestId(), node.getId(), elapsed, node.getTimeoutMs());
+                    throw e;
+                }
                 boolean opened = healthTracker.recordFailure(node);
                 String detail = e.getReason() + (opened ? "+CIRCUIT_OPENED" : "");
                 attempts.add(new ProxyResponse.Attempt(node.getId(),
-                        "FAILED", detail + "@" + decision.reason(), elapsed));
+                        "FAILED", detail + "@" + decision.reason(), elapsed, remainingAtStart));
                 tried.add(node);
-                log.warn("[gateway] 请求 {} 在节点 {} 失败：{}（依据={}，熔断={}）",
+                log.warn("[gateway] 请求 {} 在节点 {} 失败：{}（依据={}，熔断={}，剩余预算={}）",
                         request.getRequestId(), node.getId(), e.getReason(),
-                        decision.reason(), opened);
+                        decision.reason(), opened,
+                        budget.hasBudget() ? budget.remainingMs() + "ms" : "无");
                 if (!request.isIdempotent()) {
                     // 非幂等：绝不重试到第二个节点
                     throw e;
                 }
-                // 幂等：继续循环转移
+                // 幂等：继续循环转移（下一轮先检查剩余预算是否还够）
             }
         }
 
@@ -155,12 +190,24 @@ public class GatewayService {
                 "all " + attempts.size() + " attempt(s) failed for request " + request);
     }
 
-    private ProxyResponse invokeWithTimeout(UpstreamNode node, ProxyRequest request) {
+    /**
+     * @param attemptTimeoutMs 本次尝试实际允许等待的上限（已取节点超时与剩余预算的较小值）
+     * @param budgetTighter    true 表示该上限来自调用方预算而非节点自身超时；
+     *                         此时超时属于"预算掐断"，返回 BUDGET_EXHAUSTED 且不算节点失败
+     */
+    private ProxyResponse invokeWithTimeout(UpstreamNode node, ProxyRequest request,
+                                            long attemptTimeoutMs, boolean budgetTighter) {
         Future<ProxyResponse> future = invokePool.submit(() -> invoker.invoke(node, request));
         try {
-            return future.get(node.getTimeoutMs(), TimeUnit.MILLISECONDS);
+            return future.get(attemptTimeoutMs, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             future.cancel(true);
+            if (budgetTighter) {
+                throw new GatewayException(FailureReason.BUDGET_EXHAUSTED,
+                        "budget cut attempt on node " + node.getId() + " after "
+                                + attemptTimeoutMs + "ms (node timeout "
+                                + node.getTimeoutMs() + "ms)");
+            }
             throw new GatewayException(FailureReason.UPSTREAM_TIMEOUT,
                     "node " + node.getId() + " timed out after " + node.getTimeoutMs() + "ms");
         } catch (InterruptedException e) {
