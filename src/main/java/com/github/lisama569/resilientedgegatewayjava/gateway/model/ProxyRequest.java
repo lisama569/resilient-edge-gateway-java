@@ -17,14 +17,22 @@ public final class ProxyRequest {
     private final String sessionId;
     private final String method;
     private final String path;
+    /** 调用方可接受的最长总耗时（毫秒）；null 表示不设置端到端预算。 */
+    private final Long budgetMs;
 
     public ProxyRequest(String caller, String requestId, String sessionId, String method, String path) {
+        this(caller, requestId, sessionId, method, path, null);
+    }
+
+    public ProxyRequest(String caller, String requestId, String sessionId, String method, String path,
+                        Long budgetMs) {
         this.caller = caller == null ? "anonymous" : caller;
         this.requestId = (requestId == null || requestId.isBlank())
                 ? caller + ':' + sessionId + ':' + method + ':' + path : requestId;
         this.sessionId = (sessionId == null || sessionId.isBlank()) ? null : sessionId;
         this.method = method == null ? "GET" : method.toUpperCase();
         this.path = path == null ? "/" : path;
+        this.budgetMs = (budgetMs == null || budgetMs <= 0) ? null : budgetMs;
     }
 
     public String getRequestId() {
@@ -45,6 +53,11 @@ public final class ProxyRequest {
 
     public String getPath() {
         return path;
+    }
+
+    /** 调用方给定的端到端时间预算（毫秒）；未设置时返回 null。 */
+    public Long getBudgetMs() {
+        return budgetMs;
     }
 
     /**

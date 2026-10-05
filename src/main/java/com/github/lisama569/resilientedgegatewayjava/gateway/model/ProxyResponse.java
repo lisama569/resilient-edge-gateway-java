@@ -12,12 +12,20 @@ public final class ProxyResponse {
     private final String body;
     private final String servedBy;
     private final List<Attempt> attempts;
+    /** 请求结束时剩余的时间预算（毫秒）；未设置预算时为 null。 */
+    private final Long budgetRemainingMs;
 
     public ProxyResponse(int status, String body, String servedBy, List<Attempt> attempts) {
+        this(status, body, servedBy, attempts, null);
+    }
+
+    public ProxyResponse(int status, String body, String servedBy, List<Attempt> attempts,
+                         Long budgetRemainingMs) {
         this.status = status;
         this.body = body;
         this.servedBy = servedBy;
         this.attempts = List.copyOf(attempts);
+        this.budgetRemainingMs = budgetRemainingMs;
     }
 
     public int getStatus() {
@@ -34,6 +42,11 @@ public final class ProxyResponse {
 
     public List<Attempt> getAttempts() {
         return attempts;
+    }
+
+    /** 剩余预算（毫秒）；未设置预算时为 null。 */
+    public Long getBudgetRemainingMs() {
+        return budgetRemainingMs;
     }
 
     /** 单次上游尝试的记录：命中节点、结果与判定依据。 */

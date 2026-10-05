@@ -25,7 +25,7 @@ public class GatewayExceptionHandler {
             case RATE_LIMITED_CALLER, RATE_LIMITED_UPSTREAM -> HttpStatus.TOO_MANY_REQUESTS;
             case NO_AVAILABLE_NODE, ALL_NODES_CIRCUIT_OPEN, ALL_ATTEMPTS_FAILED ->
                     HttpStatus.SERVICE_UNAVAILABLE;
-            case UPSTREAM_TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;
+            case UPSTREAM_TIMEOUT, BUDGET_EXHAUSTED -> HttpStatus.GATEWAY_TIMEOUT;
             case UPSTREAM_ERROR -> HttpStatus.BAD_GATEWAY;
         };
         log.warn("[gateway] 返回失败 status={} reason={} message={}",

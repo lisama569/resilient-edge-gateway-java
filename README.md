@@ -9,13 +9,14 @@
 
 ```
 HTTP 请求 (/proxy/**)
-  └─ GatewayController        从请求头提取请求特征
+  └─ GatewayController        从请求头提取请求特征（含 X-Max-Budget-Ms 时间预算）
        └─ GatewayService      主编排
+            0. RequestBudget  端到端时间预算：从收到请求起计时（可选）
             1. RateLimiter    调用方维度限流（caller 独立配额）
             2. LoadBalancer   按会话粘滞 / 权重选择健康节点
             3. RateLimiter    上游节点维度限流（node 独立配额）
-            4. 带超时调用 SimulatedUpstreamCluster（进程内模拟上游）
-            5. HealthTracker  成功清零 / 失败累计并熔断
+            4. 带超时调用 SimulatedUpstreamCluster（等待=min(节点超时, 剩余预算)）
+            5. HealthTracker  成功清零 / 失败累计并熔断（预算掐断不计失败）
             6. 仅幂等请求允许失败转移到下一节点（非幂等只尝试 1 次）
 ```
 
@@ -23,7 +24,8 @@ HTTP 请求 (/proxy/**)
 
 | 组件 | 职责 |
 | --- | --- |
-| `model.ProxyRequest` | 请求特征：caller / requestId / sessionId / method / path |
+| `model.ProxyRequest` | 请求特征：caller / requestId / sessionId / method / path / budgetMs |
+| `model.RequestBudget` | 单请求端到端时间预算：剩余预算、每次尝试实际等待时长 |
 | `model.RouteDecision` | 路由结论：命中节点 + 判定依据（STICKY_SESSION / STICKY_REBOUND / WEIGHTED / RETRY_FALLBACK） |
 | `model.ProxyResponse` | 响应 + 完整 attempts 尝试链（节点、结果、原因、耗时） |
 | `model.FailureReason` | 可区分的失败原因枚举 |
@@ -64,7 +66,37 @@ HTTP 请求 (/proxy/**)
 - 窗口翻转与计数在临界区内完成，**突发并发下实际放行数严格等于配额，不会超发**。
 - 某调用方被限流不影响上游节点配额，反之亦然。
 
-## 5. 失败原因与 HTTP 映射（结果可区分，不返回模糊失败）
+## 5. 端到端时间预算（X-Max-Budget-Ms，可选）
+
+调用方通过请求头 `X-Max-Budget-Ms: <毫秒>` 声明"这次请求我最多能等多久"。
+
+- **计时起点**：网关收到请求即开始计时，后续所有重试与失败转移都计入同一预算。
+- **每次尝试实际等待** = `min(节点自身 timeout, 当前剩余预算)`。两个方向都取较小值：
+  预算比节点超时短则按预算提前掐断；预算宽裕则仍按节点超时判定。
+- **提前停止**：剩余预算不足以再试下一个节点时立即返回
+  `BUDGET_EXHAUSTED`（HTTP 504，与 `UPSTREAM_TIMEOUT` 的 reason 可区分），
+  不会硬撑到节点超时才回结果。
+- **预算掐断 ≠ 节点失败**：被预算提前掐断的尝试**不计入**该节点的连续失败与
+  熔断统计（attempt 记录为 `ABORTED/BUDGET_EXHAUSTED`），短预算请求不会误伤
+  健康节点；而真正的节点超时 / 上游错误仍按原规则计入健康统计并触发熔断。
+- **与既有能力的关系**：会话粘滞、权重分配、非幂等只试一次、双维度限流、
+  熔断隔离的判定规则完全不变；预算只是在"每次尝试等多久"和"是否还值得再试
+  下一个节点"两个决策点上叠加约束。
+- **并发隔离**：预算对象随单个请求创建、仅在该请求的处理线程内使用，不共享
+  任何可变状态；同一调用方并发多个不同预算的请求互不影响。
+- **兼容范围**：不带 `X-Max-Budget-Ms`（或值 <= 0）时行为与旧版完全一致，
+  响应中 `budgetRemainingMs` 为 `null`。
+
+成功响应会携带 `budgetRemainingMs`（剩余预算），每次尝试记录实际耗时
+`elapsedMs`；日志会打印每次尝试前的剩余预算与本次允许等待时长，以及本次是
+"预算用完提前结束"还是"被节点真正拖超时"：
+
+```
+[gateway] 请求 req-1 第 1 次尝试节点 node-a：剩余预算 200ms，本次最多等待 200ms
+[gateway] 请求 req-1 在节点 node-a 被预算掐断（耗时 201ms，剩余预算 0ms），不影响节点健康与熔断统计
+```
+
+## 6. 失败原因与 HTTP 映射（结果可区分，不返回模糊失败）
 
 | FailureReason | 含义 | HTTP |
 | --- | --- | --- |
@@ -75,6 +107,7 @@ HTTP 请求 (/proxy/**)
 | `UPSTREAM_TIMEOUT` | 上游调用超过节点 timeout | 504 |
 | `UPSTREAM_ERROR` | 上游返回错误（非幂等失败直接返回此原因，502） | 502 |
 | `ALL_ATTEMPTS_FAILED` | 幂等请求尝试多个节点后仍全部失败 | 503 |
+| `BUDGET_EXHAUSTED` | 调用方给定的端到端时间预算耗尽（提前停止，非节点故障） | 504 |
 
 错误响应体形如：`{"reason":"UPSTREAM_TIMEOUT","message":"node node-a timed out after 200ms"}`。
 成功响应体形如：
@@ -85,15 +118,15 @@ HTTP 请求 (/proxy/**)
              {"nodeId":"node-b","outcome":"SUCCESS","reason":"RETRY_FALLBACK","elapsedMs":1}]}
 ```
 
-## 6. 使用方式与本地验证
+## 7. 使用方式与本地验证
 
-### 6.1 运行测试（全部本地、无需任何外部依赖）
+### 7.1 运行测试（全部本地、无需任何外部依赖）
 
 ```bash
 mvn test
 ```
 
-23 个测试覆盖：
+30 个测试覆盖：
 
 - `WeightedRoutingTest`：6000 样本验证 3:2:1 权重分布；
 - `StickySessionTest`：会话健康期稳定落点、摘除/熔断后重新绑定且新流量不进入旧节点；
@@ -103,6 +136,10 @@ mvn test
 - `ConcurrentRateLimitTest`：200 突发并发严格放行配额数、双维度独立、不同调用方配额隔离；
 - `NodeManagementTest`：摘除节点调用计数恒为 0、非法权重被拒绝、FAIL_FIRST_N 自愈、
   下线后重新上线恢复服务；
+- `TimeBudgetTest`：预算掐断提前失败且原因可区分、单次尝试等待取
+  min(节点超时, 剩余预算) 两个方向边界、预算掐断不误伤节点健康/熔断、
+  真实超时仍计入失败统计、同调用方并发不同预算互不影响、非幂等预算掐断只试一次、
+  不带预算时行为完全回归；
 - `GatewayHttpIntegrationTest`：完整 HTTP 栈验证 200/429/503/504/502 与错误体 reason。
 
 测试日志（INFO）会打印**请求特征、命中节点与判定依据**，例如：
@@ -115,7 +152,7 @@ mvn test
 [ratelimit] 维度=caller key=tenant-1 被限流（窗口已用 50/50）
 ```
 
-### 6.2 启动服务并手工演练
+### 7.2 启动服务并手工演练
 
 ```bash
 mvn spring-boot:run            # server.port=0，启动日志中查看实际端口
@@ -126,6 +163,17 @@ mvn spring-boot:run            # server.port=0，启动日志中查看实际端�
 ```bash
 curl -s -H 'X-Caller: svc-1' -H 'X-Session-Id: sess-1' -H 'X-Request-Id: r1' \
      http://localhost:<port>/proxy/orders/123
+```
+
+带端到端时间预算的调用（预算 200ms，节点超时默认 300ms 时会被预算提前掐断）：
+
+```bash
+# 先把 node-a 设为慢节点（延迟 2000ms），再用短预算调用：
+curl -s -X POST 'http://localhost:<port>/admin/nodes/node-a/behavior?mode=TIMEOUT&delayMs=2000'
+curl -s -H 'X-Caller: svc-1' -H 'X-Max-Budget-Ms: 200' http://localhost:<port>/proxy/slow
+# => HTTP 504 {"reason":"BUDGET_EXHAUSTED","message":"budget cut attempt on node node-a after ..."}
+# 对比：不带预算时同一请求按节点超时处理，reason=UPSTREAM_TIMEOUT 并发生失败转移
+curl -s -H 'X-Caller: svc-1' http://localhost:<port>/proxy/slow
 ```
 
 通过管理面驱动故障/恢复（全部进程内生效）：
@@ -142,7 +190,7 @@ curl -s -X POST 'http://localhost:<port>/admin/nodes/node-a/weight?value=5'     
 curl -s http://localhost:<port>/admin/observability              # 非幂等重复执行计数
 ```
 
-### 6.3 关键配置（application.properties）
+### 7.3 关键配置（application.properties）
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -153,7 +201,7 @@ curl -s http://localhost:<port>/admin/observability              # 非幂等重�
 | `gateway.caller-default-permits-per-sec` | 100 | 调用方默认配额（0=不限） |
 | `gateway.upstream-default-permits-per-sec` | 100 | 上游默认配额（0=不限） |
 
-## 7. 兼容范围
+## 8. 兼容范围
 
 - Java 21（源码/目标版本），Spring Boot 3.4.x / Spring Framework 6.x，Jakarta Servlet。
 - 仅依赖 `spring-boot-starter-web` 与测试 starter，无额外中间件、无外部网络调用。

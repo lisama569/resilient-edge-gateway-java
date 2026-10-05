@@ -11,7 +11,8 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * 反向代理入口：/proxy/**。
  * 请求特征全部来自请求头，便于本地复现：
- * X-Caller（调用方）、X-Session-Id（会话标识）、X-Request-Id（请求幂等键）。
+ * X-Caller（调用方）、X-Session-Id（会话标识）、X-Request-Id（请求幂等键）、
+ * X-Max-Budget-Ms（调用方可接受的最长总耗时，可选；不传则行为与旧版一致）。
  */
 @RestController
 public class GatewayController {
@@ -30,10 +31,11 @@ public class GatewayController {
             @RequestHeader(value = "X-Caller", required = false) String caller,
             @RequestHeader(value = "X-Session-Id", required = false) String sessionId,
             @RequestHeader(value = "X-Request-Id", required = false) String requestId,
+            @RequestHeader(value = "X-Max-Budget-Ms", required = false) Long maxBudgetMs,
             jakarta.servlet.http.HttpServletRequest httpRequest) {
         String path = httpRequest.getRequestURI();
         ProxyRequest request = new ProxyRequest(caller, requestId, sessionId,
-                httpRequest.getMethod(), path);
+                httpRequest.getMethod(), path, maxBudgetMs);
         return gatewayService.proxy(request);
     }
 }
